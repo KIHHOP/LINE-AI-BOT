@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+env/
+
+# 環境變數（含密鑰，切勿提交）
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# 日誌
+*.log
