@@ -3,11 +3,13 @@ LINE AI 聊天機器人 — WebUI 控制台
 以 NiceGUI（FastAPI + uvicorn）打造，所有操作都在網頁完成：
 - 填寫 / 儲存 LINE 與 Ollama 設定
 - 從本地 Ollama 自動帶出模型清單
-- 一鍵啟動 / 停止 Ngrok，並顯示要貼到 LINE 的 Webhook URL
+- 一鍵啟動 / 停止 Cloudflare Tunnel，對外為固定網域
 - 即時日誌
 - 內建測試對話（不需經過 LINE 即可驗證模型）
 
 LINE Webhook 端點與本 UI 掛在同一個服務、同一個埠。
+對外網址為固定網域（例如 https://bot.linebotnanocat.com），
+由 Cloudflare Tunnel 反向代理到本機，Webhook URL 設定一次即可、不會變動。
 
 啟動：
     python webui.py
@@ -21,25 +23,10 @@ from nicegui import app as nicegui_app, ui
 
 import core
 
-try:
-    from pyngrok import ngrok, conf as ngrok_conf
-    PYNGROK_AVAILABLE = True
-except Exception:
-    PYNGROK_AVAILABLE = False
-
 # ---------------------------------------------------------------------------
 # 全域狀態
 # ---------------------------------------------------------------------------
 settings = core.load_settings()
-
-state = {
-    "ngrok_tunnel": None,     # pyngrok tunnel 物件
-    "public_url": "",         # ngrok 對外網址
-}
-
-
-def webhook_url() -> str:
-    return f"{state['public_url']}/callback" if state["public_url"] else ""
 
 
 # ---------------------------------------------------------------------------
@@ -57,17 +44,6 @@ async def line_callback(request: Request):
 
     secret = settings.get("LINE_CHANNEL_SECRET", "")
     if not core.verify_line_signature(secret, body, signature):
-        # 臨時除錯：比對收到與計算出的簽章，協助找出金鑰不符問題
-        import hmac as _hmac, hashlib as _hashlib, base64 as _base64
-        computed = ""
-        if secret:
-            _mac = _hmac.new(secret.encode("utf-8"), body, _hashlib.sha256).digest()
-            computed = _base64.b64encode(_mac).decode("utf-8")
-        core.log(
-            f"簽章不符 | secret長度={len(secret)} | 收到簽章={signature} | "
-            f"計算簽章={computed} | body={body.decode('utf-8', 'replace')[:200]}",
-            "WARNING",
-        )
         core.log("Webhook 簽章驗證失敗（檢查 Channel Secret）", "WARNING")
         return Response(content="Bad signature", status_code=400)
 
@@ -96,65 +72,17 @@ async def line_callback(request: Request):
 
 
 # ---------------------------------------------------------------------------
-# Ngrok 控制
+# Cloudflare Tunnel 控制
 # ---------------------------------------------------------------------------
-def start_ngrok():
-    if not PYNGROK_AVAILABLE:
-        ui.notify("pyngrok 未安裝", type="negative")
-        return
-    if state["ngrok_tunnel"]:
-        ui.notify("Ngrok 已在執行", type="warning")
-        return
-    try:
-        authtoken = settings.get("NGROK_AUTHTOKEN", "").strip()
-        if authtoken:
-            ngrok_conf.get_default().auth_token = authtoken
-
-        # 先清掉任何殘留的 ngrok（避免免費版固定網域被舊連線佔用，ERR_NGROK_334）
-        try:
-            for t in ngrok.get_tunnels():
-                ngrok.disconnect(t.public_url)
-        except Exception:
-            pass
-        try:
-            ngrok.kill()
-        except Exception:
-            pass
-
-        port = int(settings.get("PORT", "8080") or "8080")
-        tunnel = ngrok.connect(port, "http")
-        state["ngrok_tunnel"] = tunnel
-        state["public_url"] = tunnel.public_url
-        core.log(f"Ngrok 已啟動：{tunnel.public_url}")
-        ui.notify("Ngrok 已啟動", type="positive")
-    except Exception as e:
-        msg = str(e)
-        core.log(f"Ngrok 啟動失敗：{msg}", "ERROR")
-        if "ERR_NGROK_334" in msg or "already online" in msg:
-            hint = (
-                "偵測到舊的 ngrok 連線仍佔用網域。請先按「停止 Ngrok」，"
-                "或到 https://dashboard.ngrok.com/agents 結束既有 Agent 後再試。"
-            )
-            core.log(hint, "WARNING")
-            ui.notify(hint, type="negative", timeout=8000)
-        else:
-            ui.notify(f"Ngrok 啟動失敗：{msg}", type="negative")
+def start_tunnel():
+    ok, msg = core.start_cloudflared(settings)
+    ui.notify(msg, type="positive" if ok else "warning")
     refresh_status()
 
 
-def stop_ngrok():
-    if not state["ngrok_tunnel"]:
-        ui.notify("Ngrok 尚未啟動", type="warning")
-        return
-    try:
-        ngrok.disconnect(state["ngrok_tunnel"].public_url)
-        ngrok.kill()
-    except Exception as e:
-        core.log(f"停止 Ngrok 時發生例外：{e}", "WARNING")
-    state["ngrok_tunnel"] = None
-    state["public_url"] = ""
-    core.log("Ngrok 已停止")
-    ui.notify("Ngrok 已停止", type="positive")
+def stop_tunnel():
+    ok, msg = core.stop_cloudflared()
+    ui.notify(msg, type="positive" if ok else "warning")
     refresh_status()
 
 
@@ -166,17 +94,17 @@ ui_refs = {}
 
 
 def refresh_status():
-    """更新狀態列：Ollama、Ngrok、Webhook URL。"""
+    """更新狀態列：Ollama、Cloudflare Tunnel、Webhook URL。"""
     ollama_ok = core.check_ollama(settings.get("OLLAMA_BASE_URL", ""))
     ui_refs["ollama_badge"].text = "Ollama：連線正常" if ollama_ok else "Ollama：無法連線"
     ui_refs["ollama_badge"].props(f'color={"positive" if ollama_ok else "negative"}')
 
-    ng_on = state["ngrok_tunnel"] is not None
-    ui_refs["ngrok_badge"].text = "Ngrok：執行中" if ng_on else "Ngrok：未啟動"
-    ui_refs["ngrok_badge"].props(f'color={"positive" if ng_on else "grey"}')
+    cf_on = core.is_tunnel_running()
+    ui_refs["tunnel_badge"].text = "Cloudflare Tunnel：執行中" if cf_on else "Cloudflare Tunnel：未啟動"
+    ui_refs["tunnel_badge"].props(f'color={"positive" if cf_on else "grey"}')
 
-    url = webhook_url()
-    ui_refs["webhook_input"].value = url or "（尚未啟動 Ngrok）"
+    url = core.webhook_url(settings)
+    ui_refs["webhook_input"].value = url or "（尚未設定對外網域）"
 
     line_ready = bool(settings.get("LINE_CHANNEL_ACCESS_TOKEN") and settings.get("LINE_CHANNEL_SECRET"))
     ui_refs["line_badge"].text = "LINE 金鑰：已設定" if line_ready else "LINE 金鑰：未設定"
@@ -205,7 +133,9 @@ def save_all():
     settings["OLLAMA_BASE_URL"] = ui_refs["ollama_url_input"].value.strip()
     settings["OLLAMA_MODEL"] = ui_refs["model_select"].value or ""
     settings["OLLAMA_SYSTEM_PROMPT"] = ui_refs["prompt_input"].value
-    settings["NGROK_AUTHTOKEN"] = ui_refs["ngrok_token_input"].value.strip()
+    settings["PUBLIC_DOMAIN"] = ui_refs["domain_input"].value.strip()
+    settings["CF_TUNNEL_NAME"] = ui_refs["tunnel_name_input"].value.strip()
+    settings["CLOUDFLARED_PATH"] = ui_refs["cloudflared_path_input"].value.strip()
     settings["PORT"] = str(ui_refs["port_input"].value or 8080)
     core.save_settings(settings)
     core.log("設定已儲存")
@@ -239,7 +169,7 @@ def main_page():
             ui.label("服務狀態").classes("text-lg font-bold")
             with ui.row().classes("gap-2 flex-wrap"):
                 ui_refs["ollama_badge"] = ui.badge("Ollama：檢查中").props("color=grey")
-                ui_refs["ngrok_badge"] = ui.badge("Ngrok：未啟動").props("color=grey")
+                ui_refs["tunnel_badge"] = ui.badge("Cloudflare Tunnel：未啟動").props("color=grey")
                 ui_refs["line_badge"] = ui.badge("LINE 金鑰：未設定").props("color=warning")
 
         # LINE 設定
@@ -278,23 +208,34 @@ def main_page():
                 value=settings.get("OLLAMA_SYSTEM_PROMPT", ""),
             ).classes("w-full")
 
-        # Ngrok 設定與控制
+        # Cloudflare Tunnel 設定與控制
         with ui.card().classes("w-full"):
-            ui.label("③ Ngrok 穿透").classes("text-lg font-bold")
-            ui_refs["ngrok_token_input"] = ui.input(
-                "Ngrok Authtoken（首次使用需填）",
-                value=settings.get("NGROK_AUTHTOKEN", ""),
-                password=True, password_toggle_button=True,
+            ui.label("③ Cloudflare Tunnel 穿透").classes("text-lg font-bold")
+            ui.label(
+                "需先安裝 cloudflared 並完成一次性設定（login / tunnel create / route dns）。"
+                "詳見 README。"
+            ).classes("text-sm text-grey-7")
+            ui_refs["domain_input"] = ui.input(
+                "對外網域（例如 bot.linebotnanocat.com）",
+                value=settings.get("PUBLIC_DOMAIN", ""),
             ).classes("w-full")
-            with ui.row().classes("items-center gap-2"):
+            with ui.row().classes("w-full items-center gap-2"):
+                ui_refs["tunnel_name_input"] = ui.input(
+                    "Tunnel 名稱", value=settings.get("CF_TUNNEL_NAME", "linebot"),
+                ).classes("flex-grow")
                 ui_refs["port_input"] = ui.number(
                     "服務埠", value=int(settings.get("PORT", "8080") or "8080"), format="%d",
                 ).classes("w-32")
-                ui.button("啟動 Ngrok", icon="play_arrow", on_click=start_ngrok).props("color=positive")
-                ui.button("停止 Ngrok", icon="stop", on_click=stop_ngrok).props("color=negative outline")
-            ui.label("把下面網址貼到 LINE Developers 的 Webhook URL：").classes("text-sm text-grey-7 mt-2")
+            ui_refs["cloudflared_path_input"] = ui.input(
+                "cloudflared 執行檔路徑（在 PATH 上時填 cloudflared 即可）",
+                value=settings.get("CLOUDFLARED_PATH", "cloudflared"),
+            ).classes("w-full")
+            with ui.row().classes("items-center gap-2"):
+                ui.button("啟動 Tunnel", icon="play_arrow", on_click=start_tunnel).props("color=positive")
+                ui.button("停止 Tunnel", icon="stop", on_click=stop_tunnel).props("color=negative outline")
+            ui.label("把下面網址貼到 LINE Developers 的 Webhook URL（固定不變）：").classes("text-sm text-grey-7 mt-2")
             ui_refs["webhook_input"] = ui.input(
-                "Webhook URL", value="（尚未啟動 Ngrok）",
+                "Webhook URL", value="（尚未設定對外網域）",
             ).classes("w-full").props("readonly")
 
         # 操作按鈕
@@ -326,12 +267,11 @@ def main_page():
 
 
 def on_shutdown():
-    """關閉時清掉 ngrok。"""
-    if state["ngrok_tunnel"] and PYNGROK_AVAILABLE:
-        try:
-            ngrok.kill()
-        except Exception:
-            pass
+    """關閉時停掉 cloudflared 子行程。"""
+    try:
+        core.stop_cloudflared()
+    except Exception:
+        pass
 
 
 nicegui_app.on_shutdown(on_shutdown)

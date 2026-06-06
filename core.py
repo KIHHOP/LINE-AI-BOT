@@ -15,6 +15,9 @@ import base64
 import hmac
 import hashlib
 import logging
+import shutil
+import subprocess
+import threading
 from collections import deque
 from threading import Lock
 
@@ -34,7 +37,10 @@ DEFAULTS = {
     "OLLAMA_BASE_URL": "http://localhost:11434",
     "OLLAMA_MODEL": "qwen35:latest",
     "OLLAMA_SYSTEM_PROMPT": "你是一個友善的繁體中文助理，請用繁體中文簡潔回答使用者的問題。",
-    "NGROK_AUTHTOKEN": "",
+    # Cloudflare Tunnel 設定
+    "PUBLIC_DOMAIN": "bot.linebotnanocat.com",   # 對外固定網域（DNS 已指到 tunnel）
+    "CF_TUNNEL_NAME": "linebot",                  # cloudflared tunnel 的具名名稱
+    "CLOUDFLARED_PATH": "cloudflared",            # cloudflared 執行檔路徑（在 PATH 上時填名稱即可）
     "PORT": "8080",
 }
 
@@ -205,3 +211,191 @@ def line_push(access_token: str, to: str, text: str) -> bool:
     except Exception as e:
         log(f"push 例外：{e}", "ERROR")
         return False
+
+
+# ---------------------------------------------------------------------------
+# Cloudflare Tunnel（cloudflared 子行程）
+# ---------------------------------------------------------------------------
+# 以單一全域子行程管理，WebUI 可一鍵啟停。cloudflared 的輸出會被讀進日誌緩衝。
+_cf_proc: "subprocess.Popen | None" = None
+_cf_lock = Lock()
+
+
+def _candidate_cloudflared_paths() -> list:
+    """列出 Windows 上 cloudflared 可能的安裝位置（winget / 官方安裝包）。"""
+    candidates = []
+    local = os.environ.get("LOCALAPPDATA", "")
+    if local:
+        # winget 安裝預設會放在 WinGet\Packages\Cloudflare.cloudflared_* 下
+        wg = os.path.join(local, "Microsoft", "WinGet", "Packages")
+        if os.path.isdir(wg):
+            try:
+                for name in os.listdir(wg):
+                    if name.lower().startswith("cloudflare.cloudflared"):
+                        candidates.append(os.path.join(wg, name, "cloudflared.exe"))
+            except Exception:
+                pass
+        # winget 也可能放一份在 WinGet\Links
+        candidates.append(os.path.join(local, "Microsoft", "WinGet", "Links", "cloudflared.exe"))
+    for root in (os.environ.get("ProgramFiles", ""), os.environ.get("ProgramFiles(x86)", "")):
+        if root:
+            candidates.append(os.path.join(root, "cloudflared", "cloudflared.exe"))
+            candidates.append(os.path.join(root, "Cloudflare", "Cloudflared", "cloudflared.exe"))
+    return candidates
+
+
+def resolve_cloudflared(settings: dict) -> str:
+    """解析出可用的 cloudflared 執行檔路徑；找不到回傳空字串。
+
+    解析順序：
+    1. 設定值（若為實際檔案路徑且存在 / 或為可在 PATH 找到的名稱）
+    2. 系統 PATH（shutil.which）
+    3. Windows winget / Program Files 常見安裝位置
+    """
+    configured = (settings.get("CLOUDFLARED_PATH") or "").strip()
+    if configured:
+        # 指定的是檔案路徑
+        if os.path.sep in configured or configured.lower().endswith(".exe"):
+            if os.path.isfile(configured):
+                return configured
+        else:
+            found = shutil.which(configured)
+            if found:
+                return found
+
+    # 預設名稱在 PATH 上
+    found = shutil.which("cloudflared")
+    if found:
+        return found
+
+    # 掃描常見安裝位置（解決「已安裝但 WebUI 啟動時 PATH 尚未更新」的情況）
+    for cand in _candidate_cloudflared_paths():
+        if os.path.isfile(cand):
+            return cand
+
+    return ""
+
+
+def cloudflared_path(settings: dict) -> str:
+    """取得 cloudflared 執行檔路徑（解析失敗時退回設定值或預設名稱）。"""
+    resolved = resolve_cloudflared(settings)
+    if resolved:
+        return resolved
+    return (settings.get("CLOUDFLARED_PATH") or "cloudflared").strip() or "cloudflared"
+
+
+def is_cloudflared_installed(settings: dict) -> bool:
+    """檢查 cloudflared 是否可被找到（設定值 / PATH / 常見安裝位置）。"""
+    return bool(resolve_cloudflared(settings))
+
+
+def public_url(settings: dict) -> str:
+    """對外固定網址（https://<domain>）。"""
+    domain = (settings.get("PUBLIC_DOMAIN") or "").strip().rstrip("/")
+    if not domain:
+        return ""
+    if domain.startswith("http://") or domain.startswith("https://"):
+        return domain
+    return f"https://{domain}"
+
+
+def webhook_url(settings: dict) -> str:
+    """LINE 要填的 Webhook URL（結尾 /callback）。"""
+    base = public_url(settings)
+    return f"{base}/callback" if base else ""
+
+
+def _pump_cloudflared_output(proc: "subprocess.Popen"):
+    """背景執行緒：把 cloudflared 的輸出逐行讀進日誌緩衝。"""
+    try:
+        for raw in iter(proc.stdout.readline, ""):
+            if not raw:
+                break
+            line = raw.rstrip("\n")
+            if line:
+                log(f"[cloudflared] {line}")
+    except Exception:
+        pass
+
+
+def is_tunnel_running() -> bool:
+    """目前是否有存活的 cloudflared 子行程。"""
+    with _cf_lock:
+        return _cf_proc is not None and _cf_proc.poll() is None
+
+
+def start_cloudflared(settings: dict) -> tuple[bool, str]:
+    """啟動 cloudflared tunnel run <name>。回傳 (是否成功, 訊息)。"""
+    global _cf_proc
+    with _cf_lock:
+        if _cf_proc is not None and _cf_proc.poll() is None:
+            return False, "Cloudflare Tunnel 已在執行"
+
+        resolved = resolve_cloudflared(settings)
+        if not resolved:
+            return False, (
+                "找不到 cloudflared 執行檔。已嘗試：設定值、系統 PATH、"
+                "以及 winget/Program Files 常見安裝位置。請確認已安裝，"
+                "或在設定的「cloudflared 執行檔路徑」直接填入完整路徑"
+                "（例如 C:\\Program Files\\cloudflared\\cloudflared.exe）。"
+            )
+        log(f"使用 cloudflared：{resolved}")
+
+        tunnel_name = (settings.get("CF_TUNNEL_NAME") or "").strip()
+        if not tunnel_name:
+            return False, "尚未設定 Tunnel 名稱（CF_TUNNEL_NAME）"
+
+        path = cloudflared_path(settings)
+        port = int(settings.get("PORT", "8080") or "8080")
+        # 用 --url 直接指定本機服務埠，免去依賴 config.yml 的 ingress 設定。
+        cmd = [path, "tunnel", "--url", f"http://localhost:{port}", "run", tunnel_name]
+        try:
+            # Windows 下隱藏額外的命令視窗
+            creationflags = 0
+            if os.name == "nt":
+                creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            _cf_proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=creationflags,
+            )
+        except Exception as e:
+            _cf_proc = None
+            return False, f"啟動 cloudflared 失敗：{e}"
+
+        threading.Thread(
+            target=_pump_cloudflared_output, args=(_cf_proc,), daemon=True
+        ).start()
+
+    log(f"Cloudflare Tunnel 已啟動：{' '.join(cmd)}")
+    return True, "Cloudflare Tunnel 已啟動"
+
+
+def stop_cloudflared() -> tuple[bool, str]:
+    """停止 cloudflared 子行程。回傳 (是否成功, 訊息)。"""
+    global _cf_proc
+    with _cf_lock:
+        if _cf_proc is None or _cf_proc.poll() is not None:
+            _cf_proc = None
+            return False, "Cloudflare Tunnel 尚未啟動"
+        proc = _cf_proc
+        _cf_proc = None
+
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+    except Exception as e:
+        log(f"停止 cloudflared 時發生例外：{e}", "WARNING")
+        return False, f"停止時發生例外：{e}"
+
+    log("Cloudflare Tunnel 已停止")
+    return True, "Cloudflare Tunnel 已停止"
