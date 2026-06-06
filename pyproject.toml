@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lineai-bot"
+version = "0.1.0"
+description = "把 LINE 訊息接到本地 Ollama 模型的聊天機器人，附 WebUI 控制台與 Cloudflare Tunnel 安裝精靈"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "LINE AI Bot Contributors" }]
+keywords = ["line", "chatbot", "ollama", "cloudflare-tunnel", "nicegui"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "nicegui==2.7.0",
+    "requests>=2.32.0",
+    "python-dotenv==1.0.1",
+    "itsdangerous>=2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/your-org/lineai-bot"
+Issues = "https://github.com/your-org/lineai-bot/issues"
+
+[project.scripts]
+lineai-bot = "lineai.webui.server:run"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+lineai = ["py.typed"]

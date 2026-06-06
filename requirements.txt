@@ -1,9 +1,11 @@
-# WebUI 控制台（webui.py）所需套件
+# LINE AI Bot — WebUI 控制台所需套件
 nicegui==2.7.0
 requests>=2.32.0
 python-dotenv==1.0.1
+# NiceGUI 的 session storage 需要 itsdangerous
+itsdangerous>=2.0
 
-# 註 1：對外穿透改用 Cloudflare Tunnel（cloudflared）。cloudflared 是獨立執行檔、
-#       不透過 pip 安裝，請用 winget install Cloudflare.cloudflared（或官方安裝包）。
-# 註 2：webui.py 不依賴 line-bot-sdk，改用 requests + hmac 自行處理 LINE 簽章與回覆。
-# 註 3：若仍要使用舊版純 CLI 的 app.py，需另外安裝 flask 與 line-bot-sdk==3.11.0。
+# 註 1：對外穿透使用 Cloudflare Tunnel（cloudflared）。cloudflared 是獨立執行檔、
+#       不透過 pip 安裝，請用 winget install --id Cloudflare.cloudflared（或官方安裝包）。
+#       WebUI 內建安裝精靈會引導完成 login / create / route dns。
+# 註 2：LINE 簽章驗證與回覆改用 requests + hmac 自行實作，不綁定特定 SDK 版本。

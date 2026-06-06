@@ -1,12 +1,19 @@
 # Python
 __pycache__/
 *.py[cod]
+*.egg-info/
+build/
+dist/
 venv/
 .venv/
 env/
 
 # 環境變數（含密鑰，切勿提交）
 .env
+
+# Cloudflare Tunnel 憑證（等同金鑰，切勿提交）
+.cloudflared/
+*.pem
 
 # IDE
 .vscode/
