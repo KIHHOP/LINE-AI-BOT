@@ -4,6 +4,8 @@ requests>=2.32.0
 python-dotenv==1.0.1
 # NiceGUI 的 session storage 需要 itsdangerous
 itsdangerous>=2.0
+# SQL Server 連線（需另外安裝對應的 Microsoft ODBC Driver）
+pyodbc>=5.1.0
 
 # 註 1：對外穿透使用 Cloudflare Tunnel（cloudflared）。cloudflared 是獨立執行檔、
 #       不透過 pip 安裝，請用 winget install --id Cloudflare.cloudflared（或官方安裝包）。

@@ -61,6 +61,23 @@ SETTINGS: tuple = (
             desc="WebUI 登入密碼；留空時啟動會自動產生並印在終端機"),
     Setting("WEBUI_SECRET_KEY", "", secret=True,
             desc="登入 session 加密金鑰；留空時自動產生並寫回 .env"),
+    # SQL Server
+    Setting("SQLSERVER_ENABLED", "false",
+            desc="是否啟用 SQL Server 連線（true/false）"),
+    Setting("SQLSERVER_HOST", "localhost",
+            desc="SQL Server 主機位址"),
+    Setting("SQLSERVER_PORT", "1433",
+            desc="SQL Server 連接埠"),
+    Setting("SQLSERVER_DATABASE", "",
+            desc="資料庫名稱"),
+    Setting("SQLSERVER_USER", "",
+            desc="登入帳號（使用 SQL 驗證時填寫）"),
+    Setting("SQLSERVER_PASSWORD", "", secret=True,
+            desc="登入密碼"),
+    Setting("SQLSERVER_DRIVER", "ODBC Driver 17 for SQL Server",
+            desc="ODBC 驅動名稱，例如 ODBC Driver 17/18 for SQL Server"),
+    Setting("SQLSERVER_ENCRYPT", "false",
+            desc="是否加密連線（Driver 18 預設要求，true/false）"),
 )
 
 DEFAULTS = {s.key: s.default for s in SETTINGS}
