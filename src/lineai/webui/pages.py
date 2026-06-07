@@ -6,9 +6,9 @@ WebUI 頁面版面：
 UI 只負責呈現與呼叫；實際邏輯都在 config / ollama / line_api / tunnel / db。
 """
 
-from nicegui import ui
+from nicegui import ui, run
 
-from .. import config, ollama, tunnel, db
+from .. import config, ollama, tunnel, db, customer, memory, pipeline, pricing
 from ..logbuffer import get_logs, clear_logs, log
 from .server import settings, verify_password
 
@@ -157,9 +157,20 @@ def reload_models():
 def save_all():
     settings["LINE_CHANNEL_ACCESS_TOKEN"] = refs["token_input"].value.strip()
     settings["LINE_CHANNEL_SECRET"] = refs["secret_input"].value.strip()
+    settings["LINE_REQUIRE_FRIEND"] = "true" if refs["require_friend"].value else "false"
+    settings["LINE_NOT_FRIEND_MESSAGE"] = refs["not_friend_msg"].value.strip()
     settings["OLLAMA_BASE_URL"] = refs["ollama_url_input"].value.strip()
     settings["OLLAMA_MODEL"] = refs["model_select"].value or ""
     settings["OLLAMA_SYSTEM_PROMPT"] = refs["prompt_input"].value
+    settings["MEMORY_ENABLED"] = "true" if refs["memory_enabled"].value else "false"
+    # 四層流水線
+    if "pipeline_enabled" in refs:
+        settings["PIPELINE_ENABLED"] = "true" if refs["pipeline_enabled"].value else "false"
+        for n in (1, 2, 3, 4):
+            settings[f"PIPELINE_L{n}_MODEL"] = refs[f"l{n}_model"].value or ""
+            settings[f"PIPELINE_L{n}_PROMPT"] = refs[f"l{n}_prompt"].value
+        settings["COOLPC_ENABLED"] = "true" if refs["coolpc_enabled"].value else "false"
+        settings["COOLPC_URL"] = refs["coolpc_url"].value.strip()
     settings["PUBLIC_DOMAIN"] = refs["domain_input"].value.strip()
     settings["CF_TUNNEL_NAME"] = refs["tunnel_name_input"].value.strip()
     settings["CLOUDFLARED_PATH"] = refs["cloudflared_path_input"].value.strip()
@@ -179,13 +190,13 @@ def save_all():
     refresh_status()
 
 
-def run_test_chat():
+async def run_test_chat():
     text = refs["test_input"].value.strip()
     if not text:
         ui.notify("請先輸入測試訊息", type="warning")
         return
     refs["test_output"].value = "模型思考中…"
-    reply = ollama.ask(text, settings)
+    reply = await run.io_bound(ollama.ask, text, settings)
     refs["test_output"].value = reply
     refresh_logs()
 
@@ -234,6 +245,79 @@ def sql_reload_drivers():
         ui.notify("找不到 ODBC 驅動，請確認已安裝 pyodbc 與 Microsoft ODBC Driver", type="warning")
 
 
+def sql_init_schema():
+    """在資料庫建立所有資料表（customers / purchases / parts_prices / conversations）。"""
+    _collect_sql_settings()
+    refs["sql_result"].value = "初始化資料表中…"
+    ok, msg = customer.ensure_schema(settings)
+    refs["sql_result"].value = msg
+    ui.notify(msg, type="positive" if ok else "negative")
+    refresh_logs()
+
+
+# ---------------------------------------------------------------------------
+# AI 流水線 / 原價屋
+# ---------------------------------------------------------------------------
+def _collect_pipeline_settings():
+    settings["PIPELINE_ENABLED"] = "true" if refs["pipeline_enabled"].value else "false"
+    for n in (1, 2, 3, 4):
+        settings[f"PIPELINE_L{n}_MODEL"] = refs[f"l{n}_model"].value or ""
+        settings[f"PIPELINE_L{n}_PROMPT"] = refs[f"l{n}_prompt"].value
+    settings["COOLPC_ENABLED"] = "true" if refs["coolpc_enabled"].value else "false"
+    settings["COOLPC_URL"] = refs["coolpc_url"].value.strip()
+
+
+async def run_pipeline_test():
+    text = refs["pipe_test_input"].value.strip()
+    if not text:
+        ui.notify("請先輸入測試訊息", type="warning")
+        return
+    _collect_pipeline_settings()
+    refs["pipe_test_output"].value = "流水線執行中（會依序呼叫四個模型，請稍候）…"
+    # 阻塞的多次模型呼叫丟到背景執行緒，避免卡住事件迴圈導致前端斷線
+    result = await run.io_bound(pipeline.run, settings, text)
+    refs["pipe_test_output"].value = result
+    refresh_logs()
+
+
+async def coolpc_refresh_cache():
+    _collect_sql_settings()
+    _collect_pipeline_settings()
+    refs["coolpc_result"].value = "正在爬取原價屋並更新快取（資料量大，請稍候）…"
+    ok, msg = await run.io_bound(pricing.refresh_cache, settings)
+    refs["coolpc_result"].value = msg
+    ui.notify(msg, type="positive" if ok else "negative")
+    refresh_coolpc_count()
+    refresh_logs()
+
+
+async def coolpc_search_test():
+    _collect_sql_settings()
+    _collect_pipeline_settings()
+    kw = refs["coolpc_keyword"].value.strip()
+    if not kw:
+        ui.notify("請先輸入關鍵字", type="warning")
+        return
+    refs["coolpc_result"].value = "查詢中…"
+    hits = await run.io_bound(pricing.search, settings, kw, 10)
+    if not hits:
+        refs["coolpc_result"].value = "查無結果（快取為空時會即時爬取，仍無則表示沒有符合品項）"
+        return
+    lines = [f"{h['item_name']}　＝　{int(h['price']) if h.get('price') else '—'}"
+             for h in hits]
+    refs["coolpc_result"].value = "\n".join(lines)
+    refresh_logs()
+
+
+def refresh_coolpc_count():
+    if "coolpc_count" not in refs:
+        return
+    n = pricing.cache_count(settings)
+    refs["coolpc_count"].text = (
+        "報價快取：尚未啟用 SQL Server" if n < 0 else f"報價快取：{n} 筆品項"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 主頁（選項卡版面）
 # ---------------------------------------------------------------------------
@@ -258,6 +342,8 @@ def main_page():
             tab_line = ui.tab("LINE", icon="chat")
             tab_ollama = ui.tab("Ollama", icon="smart_toy")
             tab_sql = ui.tab("SQL Server", icon="storage")
+            tab_pipeline = ui.tab("AI 流水線", icon="account_tree")
+            tab_coolpc = ui.tab("原價屋報價", icon="price_change")
             tab_security = ui.tab("安全性", icon="lock")
             tab_test = ui.tab("測試", icon="science")
             tab_logs = ui.tab("日誌", icon="article")
@@ -341,6 +427,22 @@ def main_page():
                     ).classes("w-full")
                     ui.button("儲存全部設定", icon="save", on_click=save_all).props("color=primary")
 
+                with ui.card().classes("w-full"):
+                    ui.label("加好友檢查").classes("text-lg font-bold")
+                    refs["require_friend"] = ui.switch(
+                        "未加好友時不回覆，改傳加好友提示",
+                        value=db._truthy(settings.get("LINE_REQUIRE_FRIEND", "true")),
+                    )
+                    refs["not_friend_msg"] = ui.textarea(
+                        "尚未加好友時的自動回覆訊息",
+                        value=settings.get("LINE_NOT_FRIEND_MESSAGE",
+                                           "請先將我們加為好友後再傳訊息，謝謝！"),
+                    ).classes("w-full")
+                    ui.label(
+                        "原理：收到訊息後以 LINE profile API 查詢，回 404 即視為尚未加好友。"
+                    ).classes("text-xs text-grey-6")
+                    ui.button("儲存全部設定", icon="save", on_click=save_all).props("color=primary")
+
             # ---- Ollama ----
             with ui.tab_panel(tab_ollama):
                 with ui.card().classes("w-full"):
@@ -363,6 +465,13 @@ def main_page():
                         "系統提示詞（System Prompt）",
                         value=settings.get("OLLAMA_SYSTEM_PROMPT", ""),
                     ).classes("w-full")
+                    refs["memory_enabled"] = ui.switch(
+                        "啟用跨對話記憶（將過去對話壓縮成精華，下次對談前載入）",
+                        value=memory.is_enabled(settings),
+                    )
+                    ui.label(
+                        f"記憶儲存於：{memory.memory_dir(settings)}"
+                    ).classes("text-xs text-grey-6")
                     ui.button("儲存全部設定", icon="save", on_click=save_all).props("color=primary")
 
             # ---- SQL Server ----
@@ -414,9 +523,20 @@ def main_page():
                         "加密連線（Driver 18 預設要求）",
                         value=db._truthy(settings.get("SQLSERVER_ENCRYPT", "false")),
                     )
-                    with ui.row().classes("items-center gap-2"):
+                    with ui.row().classes("items-center gap-2 flex-wrap"):
                         ui.button("測試連線", icon="link", on_click=sql_test_connection).props("color=primary")
+                        ui.button("初始化資料表", icon="build", on_click=sql_init_schema).props("color=secondary")
                         ui.button("儲存全部設定", icon="save", on_click=save_all).props("outline")
+
+                with ui.card().classes("w-full"):
+                    ui.label("資料表結構").classes("text-lg font-bold")
+                    ui.markdown(
+                        "「初始化資料表」會在所選資料庫建立以下資料表（可重複執行，不會覆蓋既有資料）：\n"
+                        "- **customers**：客戶訊息（以 LINE userId 為主鍵，含暱稱、是否好友）\n"
+                        "- **purchases**：購買訊息（客戶的購買紀錄）\n"
+                        "- **parts_prices**：零件價格（零件編號、類別、品牌、品名、單價、庫存）\n"
+                        "- **conversations**：對話紀錄（供產生跨對話記憶精華）"
+                    ).classes("text-sm text-grey-8")
 
                 with ui.card().classes("w-full"):
                     ui.label("查詢測試（唯讀，最多顯示 50 列）").classes("text-lg font-bold")
@@ -425,6 +545,91 @@ def main_page():
                     ).classes("w-full")
                     ui.button("執行查詢", icon="play_arrow", on_click=sql_run_query).props("color=primary")
                     refs["sql_result"] = ui.textarea("結果", value="").classes("w-full").props(
+                        "readonly autogrow input-style='font-family: monospace'"
+                    )
+
+            # ---- AI 流水線 ----
+            with ui.tab_panel(tab_pipeline):
+                pipe_models = ollama.list_models(settings.get("OLLAMA_BASE_URL", ""))
+                with ui.card().classes("w-full"):
+                    ui.label("四層 AI 流水線").classes("text-lg font-bold")
+                    ui.markdown(
+                        "啟用後，每則訊息會依序經過四個角色（可各自指定模型，留空則用 Ollama 分頁的主模型），"
+                        "最大限度降低錯誤：\n"
+                        "1. **語言理解大師**：把顧客的話解析成結構化小抄（含類別、品牌），"
+                        "只擷取不臆測。\n"
+                        "2. **最強庫管**：用關鍵字＋類別查 SQL 庫存（類別過濾可避免"
+                        "「問顯卡卻撈到整台筆電」），同時查原價屋報價單比價，並彙整可選品牌與調貨天數。\n"
+                        "3. **金牌銷售**：**自行判斷資訊是否足夠**——不足就**主動反問**逐步釐清"
+                        "（先確認要顯卡或筆電，再確認品牌），足夠才報價。\n"
+                        "4. **最嚴苛店長**：**檢核**第3層的反問或報價是否正確、有無亂猜，確認後才送出。\n"
+                        "規則：所有報價皆為**未稅價**；**價高優先＝同一個品項的本店價與報價單價取較高者**，"
+                        "不會把不同產品（單買零件 vs 整台電腦）拿來比價。"
+                    ).classes("text-sm text-grey-8")
+                    refs["pipeline_enabled"] = ui.switch(
+                        "啟用四層流水線（關閉則使用單層回覆）",
+                        value=pipeline.is_enabled(settings),
+                    )
+
+                _layer_meta = [
+                    (1, "第1層 語言理解大師", "psychology"),
+                    (2, "第2層 最強庫管", "inventory"),
+                    (3, "第3層 金牌銷售", "support_agent"),
+                    (4, "第4層 最嚴苛的店長", "verified_user"),
+                ]
+                for n, title, icon in _layer_meta:
+                    with ui.card().classes("w-full"):
+                        with ui.row().classes("items-center gap-2"):
+                            ui.icon(icon)
+                            ui.label(title).classes("text-lg font-bold")
+                        cur_model = settings.get(f"PIPELINE_L{n}_MODEL", "")
+                        opts = [""] + pipe_models
+                        if cur_model and cur_model not in opts:
+                            opts = opts + [cur_model]
+                        refs[f"l{n}_model"] = ui.select(
+                            options=opts, value=cur_model,
+                            label="模型（留空＝用主模型）",
+                        ).classes("w-full")
+                        refs[f"l{n}_prompt"] = ui.textarea(
+                            "系統提示詞",
+                            value=settings.get(f"PIPELINE_L{n}_PROMPT", ""),
+                        ).classes("w-full")
+                with ui.card().classes("w-full"):
+                    ui.button("儲存全部設定", icon="save", on_click=save_all).props("color=primary")
+                    ui.separator()
+                    ui.label("流水線測試（直接跑四層，不經過 LINE）").classes("text-md font-bold")
+                    refs["pipe_test_input"] = ui.input("測試訊息，例如：我要買 RTX 4070").classes("w-full")
+                    ui.button("執行流水線測試", icon="play_arrow", on_click=run_pipeline_test).props("color=secondary")
+                    refs["pipe_test_output"] = ui.textarea("最終回覆", value="").classes("w-full").props(
+                        "readonly autogrow"
+                    )
+
+            # ---- 原價屋報價 ----
+            with ui.tab_panel(tab_coolpc):
+                with ui.card().classes("w-full"):
+                    ui.label("原價屋報價快取").classes("text-lg font-bold")
+                    ui.markdown(
+                        "為避免頻繁爬取拖垮原價屋網站、並加快查詢速度，報價會存進 SQL Server 的 "
+                        "`coolpc_cache` 表。建議每天排程「更新報價快取」一次，AI 查詢時直接讀此表。\n"
+                        "（需先在 SQL Server 分頁啟用連線並完成初始化資料表。）"
+                    ).classes("text-sm text-grey-8")
+                    refs["coolpc_enabled"] = ui.switch(
+                        "缺貨時查原價屋報價",
+                        value=pricing.is_enabled(settings),
+                    )
+                    refs["coolpc_url"] = ui.input(
+                        "原價屋報價頁網址",
+                        value=settings.get("COOLPC_URL", pricing.COOLPC_URL),
+                    ).classes("w-full")
+                    refs["coolpc_count"] = ui.label("報價快取：—").classes("text-sm text-grey-7")
+                    with ui.row().classes("items-center gap-2 flex-wrap"):
+                        ui.button("立即更新報價快取", icon="cloud_download", on_click=coolpc_refresh_cache).props("color=primary")
+                        ui.button("儲存全部設定", icon="save", on_click=save_all).props("outline")
+                with ui.card().classes("w-full"):
+                    ui.label("報價查詢測試").classes("text-lg font-bold")
+                    refs["coolpc_keyword"] = ui.input("關鍵字，例如：4070").classes("w-full")
+                    ui.button("查詢", icon="search", on_click=coolpc_search_test).props("color=secondary")
+                    refs["coolpc_result"] = ui.textarea("結果", value="").classes("w-full").props(
                         "readonly autogrow input-style='font-family: monospace'"
                     )
 
@@ -466,5 +671,6 @@ def main_page():
 
     refresh_status()
     refresh_logs()
+    refresh_coolpc_count()
     ui.timer(2.0, refresh_logs)
     ui.timer(5.0, refresh_status)
