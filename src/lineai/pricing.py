@@ -109,6 +109,19 @@ def _truthy(value: str) -> bool:
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
+def allowed_category_nums(settings: dict) -> set:
+    """解析 COOLPC_CATEGORY_NUMS 設定成分類編號集合；留空代表不過濾（全部）。"""
+    raw = (settings.get("COOLPC_CATEGORY_NUMS") or "").strip()
+    if not raw:
+        return set()
+    nums = set()
+    for tok in re.split(r"[,\s]+", raw):
+        tok = tok.strip()
+        if tok.isdigit():
+            nums.add(int(tok))
+    return nums
+
+
 def is_enabled(settings: dict) -> bool:
     return _truthy(settings.get("COOLPC_ENABLED", "true"))
 
@@ -230,7 +243,7 @@ def _append_item(items: list, category: str, raw: str):
     })
 
 
-def parse_options(html_text: str) -> list:
+def parse_options(html_text: str, allowed_nums: set | None = None) -> list:
     """解析 evaluate.php，回傳 [{category, brand, item_name, price, raw_text}, ...]。
 
     主路徑（依原價屋實際結構，種類由結構決定、不需臆測）：
@@ -238,8 +251,12 @@ def parse_options(html_text: str) -> list:
       2) 每個 <SELECT name=nN> 區塊裡的 <OPTION> 即該分類的商品；
          分類標題經 _normalize_category() 正規化成簡短種類。
     後備路徑：舊式 optgroup/option，或最後退回純規則 _guess_category()。
+
+    allowed_nums：若提供（非空），主路徑只擷取分類編號在此集合內的 SELECT，
+                  其餘分類略過；同時停用無編號資訊的後備路徑，避免寫入未指定分類。
     """
     items = []
+    allowed_nums = allowed_nums or None
 
     # 主路徑：select name=nN + 分類標題表
     cat_titles = {int(m.group(1)): m.group(2).strip()
@@ -248,11 +265,21 @@ def parse_options(html_text: str) -> list:
     if selects:
         for sm in selects:
             num = int(sm.group(1))
+            # 只寫入指定分類編號（未指定則全收）
+            if allowed_nums and num not in allowed_nums:
+                continue
             category = _normalize_category(cat_titles.get(num, ""))
             for raw in _OPTION_TEXT_RE.findall(sm.group(2)):
                 _append_item(items, category, raw)
         if items:
             return items
+        # 有指定分類但主路徑沒抓到任何品項：不退到無編號後備，直接回空
+        if allowed_nums:
+            return items
+
+    # 指定了分類編號時，後備路徑沒有編號資訊、無法過濾，故不啟用
+    if allowed_nums:
+        return items
 
     # 後備一：標準 optgroup（含結束標籤）
     groups = _OPTGROUP_RE.findall(html_text)
@@ -274,7 +301,10 @@ def parse_options(html_text: str) -> list:
 
 
 def fetch(settings: dict, timeout: int = 30) -> list:
-    """即時抓取並解析原價屋報價，回傳品項清單（不寫入快取）。"""
+    """即時抓取並解析原價屋報價，回傳品項清單（不寫入快取）。
+
+    依 COOLPC_CATEGORY_NUMS 設定，只擷取指定分類編號的品項。
+    """
     url = settings.get("COOLPC_URL", COOLPC_URL) or COOLPC_URL
     try:
         resp = requests.get(url, headers=DEFAULT_HEADERS, timeout=timeout)
@@ -282,7 +312,7 @@ def fetch(settings: dict, timeout: int = 30) -> list:
         # evaluate.php 編碼偵測（多為 UTF-8，保險起見以 apparent_encoding 後備）
         if not resp.encoding or resp.encoding.lower() in ("iso-8859-1",):
             resp.encoding = resp.apparent_encoding or "utf-8"
-        items = parse_options(resp.text)
+        items = parse_options(resp.text, allowed_category_nums(settings))
         log(f"原價屋爬取完成，解析到 {len(items)} 筆品項")
         return items
     except Exception as e:
