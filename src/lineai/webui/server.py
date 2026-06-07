@@ -118,12 +118,14 @@ def _process_text_event(access_token: str, user_id: str, user_text: str) -> str:
         "is_friend": True,
     })
 
-    # 3) 讀取對話精華
+    # 3) 讀取對話精華 + 近期對話紀錄（供 L1 綜合上下文理解多輪補欄）
     summary = memory.load_summary(settings, user_id)
+    history = customer.recent_messages(settings, user_id, limit=10) if user_id else []
 
     # 4) 產生回覆：啟用四層流水線則走 pipeline，否則單層回覆（皆帶記憶）
     if pipeline.is_enabled(settings):
-        reply_text = pipeline.run(settings, user_text, memory_summary=summary)
+        reply_text = pipeline.run(settings, user_text, memory_summary=summary,
+                                  history=history, user_id=user_id)
     else:
         reply_text = ollama.ask(user_text, settings, memory_summary=summary)
 

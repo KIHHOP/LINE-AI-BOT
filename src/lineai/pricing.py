@@ -37,13 +37,72 @@ _PRICE_PATTERNS = [
     re.compile(r"\$\s*([0-9][0-9,]*)"),
     re.compile(r"(?:NT\$|NTD)\s*([0-9][0-9,]*)", re.IGNORECASE),
 ]
-# <optgroup label="分類"> ... </optgroup>
-_OPTGROUP_RE = re.compile(
-    r'<optgroup[^>]*label="([^"]*)"[^>]*>(.*?)</optgroup>',
+# 原價屋 evaluate.php 的實際結構（重點）：
+# - 每個產品大分類是一個 <SELECT name=nN>，N 是分類編號（n1..n30）。
+# - 分類中文標題在 select 前面，形如：<TD class=w>5<TD class=t>主機板 MB ...
+# - <OPTION> 沒有對應的 </OPTION> 結束標籤，內容延續到下一個 < 為止。
+# 因此用「分類標題表 + select 區塊」對應，種類即可 100% 由結構決定（不需臆測）。
+_HEADER_RE = re.compile(
+    r"<TD\s+class=w>\s*(\d+)\s*<TD\s+class=t>\s*([^<]+?)\s*(?:<a|<TD|<)",
+    re.IGNORECASE,
+)
+_SELECT_RE = re.compile(
+    r"<SELECT[^>]*\bname=n(\d+)\b[^>]*>(.*?)</SELECT>",
     re.IGNORECASE | re.DOTALL,
 )
-# <option ...>內容</option>
+# 無結束標籤的 OPTION：抓到下一個 < 之前的文字
+_OPTION_TEXT_RE = re.compile(r"<OPTION\b[^>]*>([^<]*)", re.IGNORECASE)
+
+# 舊版（保留作為後備）：標準 optgroup / option（含結束標籤、雙引號 label）
+_OPTGROUP_RE = re.compile(
+    r"<optgroup[^>]*label=[\"']([^\"']*)[\"'][^>]*>(.*?)</optgroup>",
+    re.IGNORECASE | re.DOTALL,
+)
 _OPTION_RE = re.compile(r"<option[^>]*>(.*?)</option>", re.IGNORECASE | re.DOTALL)
+
+# coolpc 分類標題 → 正規化種類；用關鍵字比對，避免分類編號變動。
+# 順序即優先序（較專一的關鍵字放前面）。
+_CATEGORY_NORMALIZE = (
+    ("筆電", "筆電"), ("平板", "筆電"), ("穿戴", "筆電"),
+    ("套裝", "主機"), ("品牌", "主機"), ("AIO", "主機"),
+    ("準系統", "主機"), ("迷你", "主機"),
+    ("處理器", "處理器"), ("CPU", "處理器"),
+    ("主機板", "主機板"), ("MB", "主機板"),
+    ("記憶體", "記憶體"), ("RAM", "記憶體"),
+    ("固態硬碟", "硬碟"), ("SSD", "硬碟"), ("M.2", "硬碟"),
+    ("傳統", "硬碟"), ("HDD", "硬碟"),
+    ("隨身", "儲存"), ("記憶卡", "儲存"),
+    ("水冷", "散熱"), ("散熱", "散熱"),
+    ("顯示卡", "顯示卡"), ("VGA", "顯示卡"),
+    ("螢幕", "螢幕"), ("投影", "螢幕"), ("壁掛", "螢幕"),
+    ("機殼風扇", "機殼配件"), ("機殼配件", "機殼配件"),
+    ("機殼", "機殼"), ("CASE", "機殼"),
+    ("電源", "電源"), ("PSU", "電源"),
+    ("鍵盤", "鍵盤"),
+    ("滑鼠", "滑鼠"), ("鼠墊", "滑鼠"), ("數位板", "滑鼠"),
+    ("分享器", "網通"), ("網卡", "網通"), ("網通", "網通"),
+    ("NAS", "網通"), ("IPCAM", "網通"),
+    ("音效", "影音"), ("電視卡", "影音"),
+    ("喇叭", "喇叭耳機"), ("耳機", "喇叭耳機"), ("麥克風", "喇叭耳機"),
+    ("燒錄", "光碟機"),
+    ("週邊", "週邊"), ("讀卡機", "週邊"), ("硬碟座", "週邊"),
+    ("行車", "週邊"), ("視訊鏡頭", "週邊"),
+    ("UPS", "週邊"), ("印表機", "週邊"), ("掃描", "週邊"),
+    ("擴充卡", "介面卡"), ("Raid", "介面卡"),
+    ("傳輸線", "線材"), ("轉頭", "線材"), ("KVM", "線材"),
+    ("軟體", "軟體"), ("禮物卡", "軟體"),
+    ("福利品", "福利品"),
+)
+
+
+def _normalize_category(title: str) -> str:
+    """把 coolpc 分類標題正規化成簡短種類；對不到時回退為去除開頭編號的標題。"""
+    t = (title or "").strip()
+    up = t.upper()
+    for kw, norm in _CATEGORY_NORMALIZE:
+        if kw.upper() in up:
+            return norm
+    return re.sub(r"^\s*\d+\s*", "", t).strip()
 
 
 def _truthy(value: str) -> bool:
@@ -93,32 +152,124 @@ def _guess_brand(text: str) -> str:
     return ""
 
 
+# 種類判斷規則（不依賴 LLM，確保每筆都能被分類）。
+# 螢幕尺寸（用來輔助辨識筆電 vs 螢幕）：例如 16吋、15.6 inch
+_SCREEN_RE = re.compile(r"\d{2}(?:\.\d)?\s*(?:吋|inch)", re.IGNORECASE)
+_LAPTOP_RE = re.compile(r"筆電|筆記型|laptop|notebook", re.IGNORECASE)
+# 整機/準系統：含「全配/套裝/主機/桌機」等字樣
+_WHOLE_RE = re.compile(r"全配|套裝|準系統|整機|桌機|主機(?!板)", re.IGNORECASE)
+# 各零件類別關鍵字（順序即優先序）
+_COMPONENT_RULES = (
+    ("顯示卡", re.compile(
+        r"顯示卡|顯卡|GeForce|Radeon|\bRTX\s?\d|\bGTX\s?\d|\bRX\s?\d{3,4}"
+        r"|\bARC\s?[AB]?\d", re.IGNORECASE)),
+    ("主機板", re.compile(
+        r"主機板|主板|晶片組|\b[ZBHX]\d{3}\b|\bTRX\d{2}\b|\bWRX\d{2}\b"
+        r"|E-ATX|Mini-ITX|Micro-ATX|\bM-ATX\b", re.IGNORECASE)),
+    ("處理器", re.compile(
+        r"處理器|\bCPU\b|\bi[3579]\b|\bUltra\s?[3579]\b|Ryzen|Threadripper"
+        r"|Core\s?Ultra|\b\d{4,5}[KFXTHG]+\b", re.IGNORECASE)),
+    ("記憶體", re.compile(r"記憶體|\bDDR[345]\b|\bRAM\b", re.IGNORECASE)),
+    ("硬碟", re.compile(
+        r"固態硬碟|硬碟|\bSSD\b|\bNVMe\b|\bHDD\b|\bM\.?2\b", re.IGNORECASE)),
+    ("電源", re.compile(
+        r"電源供應器|電源|\bPSU\b|\d{3,4}\s?W\b|80\s?PLUS", re.IGNORECASE)),
+    ("散熱", re.compile(r"水冷|散熱|塔散|風扇|\bAIO\b|cooler", re.IGNORECASE)),
+    ("機殼", re.compile(r"機殼|機箱|\bCASE\b", re.IGNORECASE)),
+)
+_MONITOR_RE = re.compile(r"螢幕|顯示器|monitor|曲面", re.IGNORECASE)
+
+
+def _scan_category(s: str) -> str:
+    """純文字規則判斷種類；無法判斷回空字串。"""
+    s = s or ""
+    matches = [name for name, rgx in _COMPONENT_RULES if rgx.search(s)]
+    has_screen = bool(_SCREEN_RE.search(s))
+    # 筆電：明寫筆電，或「螢幕尺寸 + 多個零件規格」的組合（原價屋筆電常不寫「筆電」）
+    if _LAPTOP_RE.search(s) or (has_screen and len(matches) >= 2):
+        return "筆電"
+    # 整機：明寫全配/主機，或同時含 3 種以上零件（組合機/套裝）
+    if _WHOLE_RE.search(s) or len(matches) >= 3:
+        return "主機"
+    if matches:
+        return matches[0]
+    if has_screen or _MONITOR_RE.search(s):
+        return "螢幕"
+    return ""
+
+
+def _guess_category(text: str, label: str = "") -> str:
+    """從品名（與 optgroup 標籤後備）推斷種類；找不到回空字串。"""
+    return _scan_category(text) or _scan_category(label)
+
+
+def _clean_item_name(text: str) -> str:
+    """把 OPTION 文字整理成乾淨品名：去價格與後面的活動符號（◆ ★ 等）。"""
+    text = html.unescape(text or "")
+    # 砍掉價格與其後的活動標記（$12990 ◆ ★ 熱賣…）
+    text = re.split(r",?\s*\$\d", text, maxsplit=1)[0]
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _append_item(items: list, category: str, raw: str):
+    """把一筆 OPTION 文字轉成品項並加入 items（無價格者略過）。"""
+    full = re.sub(r"\s+", " ", html.unescape(raw or "")).strip()
+    if not full or len(full) < 2:
+        return
+    price = _parse_price(full)
+    if price is None:
+        return  # 跳過「共有商品 N 樣」等無價格的標頭/說明列
+    name = _clean_item_name(full) or full
+    items.append({
+        "category": category,
+        "brand": _guess_brand(full),
+        "item_name": name,
+        "price": price,
+        "raw_text": full[:1000],
+    })
+
+
 def parse_options(html_text: str) -> list:
-    """解析 evaluate.php 內容，回傳 [{category, brand, item_name, price, raw_text}, ...]。"""
+    """解析 evaluate.php，回傳 [{category, brand, item_name, price, raw_text}, ...]。
+
+    主路徑（依原價屋實際結構，種類由結構決定、不需臆測）：
+      1) 先用 <TD class=w>N<TD class=t>標題 建立『分類編號→中文標題』對照表。
+      2) 每個 <SELECT name=nN> 區塊裡的 <OPTION> 即該分類的商品；
+         分類標題經 _normalize_category() 正規化成簡短種類。
+    後備路徑：舊式 optgroup/option，或最後退回純規則 _guess_category()。
+    """
     items = []
 
-    def handle_block(category: str, block: str):
-        for raw in _OPTION_RE.findall(block):
-            text = _clean(raw)
-            if not text or len(text) < 2:
-                continue
-            price = _parse_price(text)
-            items.append({
-                "category": category or "",
-                "brand": _guess_brand(text),
-                "item_name": text,
-                "price": price,
-                "raw_text": text[:1000],
-            })
+    # 主路徑：select name=nN + 分類標題表
+    cat_titles = {int(m.group(1)): m.group(2).strip()
+                  for m in _HEADER_RE.finditer(html_text)}
+    selects = list(_SELECT_RE.finditer(html_text))
+    if selects:
+        for sm in selects:
+            num = int(sm.group(1))
+            category = _normalize_category(cat_titles.get(num, ""))
+            for raw in _OPTION_TEXT_RE.findall(sm.group(2)):
+                _append_item(items, category, raw)
+        if items:
+            return items
 
+    # 後備一：標準 optgroup（含結束標籤）
     groups = _OPTGROUP_RE.findall(html_text)
     if groups:
         for label, block in groups:
-            handle_block(_clean(label), block)
-    else:
-        # 沒有 optgroup 時，退而求其次直接抓全部 option
-        handle_block("", html_text)
+            category = _normalize_category(_clean(label)) or _guess_category("", _clean(label))
+            for raw in _OPTION_RE.findall(block):
+                text = _clean(raw)
+                category2 = category or _guess_category(text)
+                _append_item(items, category2, text)
+        if items:
+            return items
 
+    # 後備二：直接抓所有 option，種類用純規則猜
+    for raw in _OPTION_RE.findall(html_text):
+        text = _clean(raw)
+        _append_item(items, _guess_category(text), text)
     return items
 
 
@@ -143,7 +294,11 @@ def fetch(settings: dict, timeout: int = 30) -> list:
 # 快取（存 SQL Server coolpc_cache）
 # ---------------------------------------------------------------------------
 def refresh_cache(settings: dict) -> tuple[bool, str]:
-    """大爬一次並覆蓋 coolpc_cache。建議每天排程執行一次。"""
+    """大爬一次並覆蓋 coolpc_cache。建議每天排程執行一次。
+
+    種類/品牌/品名在 parse_options() 解析時即依原價屋網頁結構決定（快速、準確），
+    不需任何 AI 後處理。
+    """
     if not db.is_enabled(settings) or not db.PYODBC_AVAILABLE:
         return False, "未啟用 SQL Server，無法寫入報價快取。"
     items = fetch(settings)

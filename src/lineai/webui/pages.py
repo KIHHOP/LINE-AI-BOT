@@ -163,10 +163,10 @@ def save_all():
     settings["OLLAMA_MODEL"] = refs["model_select"].value or ""
     settings["OLLAMA_SYSTEM_PROMPT"] = refs["prompt_input"].value
     settings["MEMORY_ENABLED"] = "true" if refs["memory_enabled"].value else "false"
-    # 四層流水線
+    # 兩層流水線
     if "pipeline_enabled" in refs:
         settings["PIPELINE_ENABLED"] = "true" if refs["pipeline_enabled"].value else "false"
-        for n in (1, 2, 3, 4):
+        for n in (1, 2):
             settings[f"PIPELINE_L{n}_MODEL"] = refs[f"l{n}_model"].value or ""
             settings[f"PIPELINE_L{n}_PROMPT"] = refs[f"l{n}_prompt"].value
         settings["COOLPC_ENABLED"] = "true" if refs["coolpc_enabled"].value else "false"
@@ -260,7 +260,7 @@ def sql_init_schema():
 # ---------------------------------------------------------------------------
 def _collect_pipeline_settings():
     settings["PIPELINE_ENABLED"] = "true" if refs["pipeline_enabled"].value else "false"
-    for n in (1, 2, 3, 4):
+    for n in (1, 2):
         settings[f"PIPELINE_L{n}_MODEL"] = refs[f"l{n}_model"].value or ""
         settings[f"PIPELINE_L{n}_PROMPT"] = refs[f"l{n}_prompt"].value
     settings["COOLPC_ENABLED"] = "true" if refs["coolpc_enabled"].value else "false"
@@ -273,7 +273,7 @@ async def run_pipeline_test():
         ui.notify("請先輸入測試訊息", type="warning")
         return
     _collect_pipeline_settings()
-    refs["pipe_test_output"].value = "流水線執行中（會依序呼叫四個模型，請稍候）…"
+    refs["pipe_test_output"].value = "流水線執行中（會依序呼叫兩個模型，請稍候）…"
     # 阻塞的多次模型呼叫丟到背景執行緒，避免卡住事件迴圈導致前端斷線
     result = await run.io_bound(pipeline.run, settings, text)
     refs["pipe_test_output"].value = result
@@ -470,7 +470,7 @@ def main_page():
                         value=memory.is_enabled(settings),
                     )
                     ui.label(
-                        f"記憶儲存於：{memory.memory_dir(settings)}"
+                        f"記憶儲存於：{memory.memory_root(settings)}（每位客戶一個專屬資料夾）"
                     ).classes("text-xs text-grey-6")
                     ui.button("儲存全部設定", icon="save", on_click=save_all).props("color=primary")
 
@@ -552,30 +552,24 @@ def main_page():
             with ui.tab_panel(tab_pipeline):
                 pipe_models = ollama.list_models(settings.get("OLLAMA_BASE_URL", ""))
                 with ui.card().classes("w-full"):
-                    ui.label("四層 AI 流水線").classes("text-lg font-bold")
+                    ui.label("兩層 AI 流水線").classes("text-lg font-bold")
                     ui.markdown(
-                        "啟用後，每則訊息會依序經過四個角色（可各自指定模型，留空則用 Ollama 分頁的主模型），"
-                        "最大限度降低錯誤：\n"
-                        "1. **語言理解大師**：把顧客的話解析成結構化小抄（含類別、品牌），"
-                        "只擷取不臆測。\n"
-                        "2. **最強庫管**：用關鍵字＋類別查 SQL 庫存（類別過濾可避免"
-                        "「問顯卡卻撈到整台筆電」），同時查原價屋報價單比價，並彙整可選品牌與調貨天數。\n"
-                        "3. **金牌銷售**：**自行判斷資訊是否足夠**——不足就**主動反問**逐步釐清"
-                        "（先確認要顯卡或筆電，再確認品牌），足夠才報價。\n"
-                        "4. **最嚴苛店長**：**檢核**第3層的反問或報價是否正確、有無亂猜，確認後才送出。\n"
-                        "規則：所有報價皆為**未稅價**；**價高優先＝同一個品項的本店價與報價單價取較高者**，"
-                        "不會把不同產品（單買零件 vs 整台電腦）拿來比價。"
+                        "啟用後，每則訊息會依序經過兩個角色（可各自指定模型，留空則用 Ollama 分頁的主模型），"
+                        "降低報價錯誤：\n"
+                        "1. **銷售**：系統先用程式查好貨況——**有庫存就優先賣自家庫存（source=local）**，"
+                        "沒庫存才報**原價屋的調貨價（source=coolpc）**；銷售依事實寫出親切口語的報價回覆。\n"
+                        "2. **店長審查**：送出前核對**價格是否被竄改、來源與話術是否一致、有無臆測**，"
+                        "通過才送出。\n"
+                        "規則：所有報價皆為**未稅價**，價格一律以程式查到的貨況為準，模型不得臆測或捏造。"
                     ).classes("text-sm text-grey-8")
                     refs["pipeline_enabled"] = ui.switch(
-                        "啟用四層流水線（關閉則使用單層回覆）",
+                        "啟用兩層流水線（關閉則使用單層回覆）",
                         value=pipeline.is_enabled(settings),
                     )
 
                 _layer_meta = [
-                    (1, "第1層 語言理解大師", "psychology"),
-                    (2, "第2層 最強庫管", "inventory"),
-                    (3, "第3層 金牌銷售", "support_agent"),
-                    (4, "第4層 最嚴苛的店長", "verified_user"),
+                    (1, "第1層 銷售（依貨況寫報價；庫存優先、缺貨報原價屋）", "support_agent"),
+                    (2, "第2層 店長審查（核對價格、來源、無臆測）", "verified_user"),
                 ]
                 for n, title, icon in _layer_meta:
                     with ui.card().classes("w-full"):
@@ -597,7 +591,7 @@ def main_page():
                 with ui.card().classes("w-full"):
                     ui.button("儲存全部設定", icon="save", on_click=save_all).props("color=primary")
                     ui.separator()
-                    ui.label("流水線測試（直接跑四層，不經過 LINE）").classes("text-md font-bold")
+                    ui.label("流水線測試（直接跑兩層，不經過 LINE）").classes("text-md font-bold")
                     refs["pipe_test_input"] = ui.input("測試訊息，例如：我要買 RTX 4070").classes("w-full")
                     ui.button("執行流水線測試", icon="play_arrow", on_click=run_pipeline_test).props("color=secondary")
                     refs["pipe_test_output"] = ui.textarea("最終回覆", value="").classes("w-full").props(
